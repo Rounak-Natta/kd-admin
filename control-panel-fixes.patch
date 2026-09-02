@@ -1,0 +1,558 @@
+--- /tmp/kd/original/kd-admin-main/README.md	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/README.md	2026-08-31 09:42:02.488449267 +0000
+@@ -22,7 +22,7 @@
+ Default development admin is controlled by `.env`:
+ 
+ - `admin@kitchendiaries.local`
+-- `Admin@12345`
++- `Admin@123456`
+ 
+ Change it before production deployment.
+ 
+--- /tmp/kd/original/kd-admin-main/PRODUCTION_SETUP.md	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/PRODUCTION_SETUP.md	2026-08-31 09:42:02.488574156 +0000
+@@ -81,7 +81,7 @@
+ - `CONTROL_ADMIN_PASSWORD` (12+ characters; use a unique high-entropy password)
+ - `CONTROL_ADMIN_NAME`
+ 
+-The production seed refuses missing admin credentials and refuses the known development password `Admin@12345`.
++The production seed refuses missing admin credentials and refuses the known development password `Admin@123456`.
+ 
+ ## Checks
+ 
+--- /tmp/kd/original/kd-admin-main/package.json	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/package.json	2026-08-31 09:44:26.149037228 +0000
+@@ -12,7 +12,8 @@
+     "db:migrate:deploy": "node -e \"console.log('Shared database migrations are owned by the Kitchen Diaries POS repository. Run npm run db:migrate:deploy there.')\"",
+     "db:seed:admin": "tsx prisma/seed-control-admin.ts",
+     "verify": "npm run lint && npm run typecheck && npm run build",
+-    "setup:admin": "npm run db:generate && npm run db:seed:admin"
++    "setup:admin": "npm run db:generate && npm run db:seed:admin",
++    "test": "tsx --test tests/subscription-rules.test.ts"
+   },
+   "dependencies": {
+     "@prisma/client": "^6.19.3",
+--- /tmp/kd/original/kd-admin-main/src/config/subscription-plans.ts	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/src/config/subscription-plans.ts	2026-08-31 09:41:36.596959934 +0000
+@@ -20,6 +20,9 @@
+   durationMonths: number,
+   customPrice?: number,
+ ): number | null {
+-  if (plan === "CUSTOM") return customPrice ?? null;
+-  return SUBSCRIPTION_PLANS[plan].prices[durationMonths as 6 | 12] ?? null;
++  if (plan === "CUSTOM") {
++    return Number.isFinite(customPrice) && (customPrice ?? 0) > 0 ? customPrice! : null;
++  }
++  if (durationMonths !== 6 && durationMonths !== 12) return null;
++  return SUBSCRIPTION_PLANS[plan].prices[durationMonths] ?? null;
+ }
+--- /dev/null	2026-08-31 09:35:07.995076787 +0000
++++ /tmp/kd/kd-admin-main/src/lib/subscription-rules.ts	2026-08-31 09:41:36.139757287 +0000
+@@ -0,0 +1,32 @@
++import { SUBSCRIPTION_PLANS, type SubscriptionPlanKey } from "@/config/subscription-plans";
++
++export const MIN_DEVICE_LIMIT = 1;
++export const MAX_DEVICE_LIMIT = 10;
++export const MIN_CUSTOM_DURATION_MONTHS = 1;
++export const MAX_CUSTOM_DURATION_MONTHS = 36;
++
++export function isValidSubscriptionDuration(plan: SubscriptionPlanKey, months: number): boolean {
++  if (!Number.isInteger(months)) return false;
++  if (plan === "CUSTOM") {
++    return months >= MIN_CUSTOM_DURATION_MONTHS && months <= MAX_CUSTOM_DURATION_MONTHS;
++  }
++  return months === 6 || months === 12;
++}
++
++export function validateSubscriptionPrice(
++  plan: SubscriptionPlanKey,
++  durationMonths: number,
++  customPrice?: number,
++): number | null {
++  if (!isValidSubscriptionDuration(plan, durationMonths)) return null;
++  if (plan === "CUSTOM") {
++    return Number.isFinite(customPrice) && (customPrice ?? 0) > 0 ? customPrice! : null;
++  }
++  return SUBSCRIPTION_PLANS[plan].prices[durationMonths as 6 | 12] ?? null;
++}
++
++export function addMonths(from: Date, months: number): Date {
++  const result = new Date(from);
++  result.setMonth(result.getMonth() + months);
++  return result;
++}
+--- /tmp/kd/original/kd-admin-main/src/app/api/control/restaurants/route.ts	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/src/app/api/control/restaurants/route.ts	2026-08-31 09:41:57.460598529 +0000
+@@ -3,6 +3,7 @@
+ import { getControlAdmin } from "@/lib/control-auth";
+ import { prisma } from "@/lib/prisma";
+ import { resolvePlanPrice, type SubscriptionPlanKey } from "@/config/subscription-plans";
++import { MAX_DEVICE_LIMIT, MIN_DEVICE_LIMIT, isValidSubscriptionDuration } from "@/lib/subscription-rules";
+ 
+ const PLANS = new Set(Object.values(SubscriptionPlan));
+ 
+@@ -18,6 +19,9 @@
+   try {
+     const url = new URL(request.url);
+     const search = (url.searchParams.get("search") ?? "").trim();
++    const requestedLimit = Number(url.searchParams.get("limit") ?? "50");
++    const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(10, Math.trunc(requestedLimit))) : 50;
++    const cursor = url.searchParams.get("cursor") || undefined;
+     const restaurants = await prisma.restaurant.findMany({
+       where: search
+         ? {
+@@ -29,7 +33,9 @@
+             ],
+           }
+         : undefined,
+-      orderBy: { createdAt: "desc" },
++      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
++      take: limit + 1,
++      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+       select: {
+         id: true,
+         name: true,
+@@ -65,7 +71,9 @@
+       },
+     });
+ 
+-    return apiSuccess(restaurants);
++    const hasMore = restaurants.length > limit;
++    const page = hasMore ? restaurants.slice(0, limit) : restaurants;
++    return apiSuccess({ items: page, nextCursor: hasMore ? page.at(-1)?.id ?? null : null });
+   } catch (error) {
+     console.error("CONTROL_RESTAURANTS_GET_ERROR", error);
+     return apiError("Unable to load restaurants.", 500, { code: "INTERNAL_ERROR" });
+@@ -96,8 +104,8 @@
+     if (action === "set_max_devices") {
+       if (!subscription) return apiError("Subscription not found.", 404, { code: "NOT_FOUND" });
+       const maxDevices = Number(body.maxDevices);
+-      if (!Number.isInteger(maxDevices) || maxDevices < 1 || maxDevices > 50) {
+-        return apiError("maxDevices must be between 1 and 50.", 400, { code: "VALIDATION_ERROR" });
++      if (!Number.isInteger(maxDevices) || maxDevices < MIN_DEVICE_LIMIT || maxDevices > MAX_DEVICE_LIMIT) {
++        return apiError(`maxDevices must be between ${MIN_DEVICE_LIMIT} and ${MAX_DEVICE_LIMIT}.`, 400, { code: "VALIDATION_ERROR" });
+       }
+       const activeDevices = await prisma.device.count({ where: { restaurantId, status: "ACTIVE" } });
+       if (maxDevices < activeDevices) {
+@@ -119,14 +127,20 @@
+       const requestedPlan = typeof body.plan === "string" ? body.plan.toUpperCase() : subscription.plan;
+       if (!PLANS.has(requestedPlan as SubscriptionPlan)) return apiError("Invalid subscription plan.", 400);
+       const plan = requestedPlan as SubscriptionPlanKey;
++      if (!isValidSubscriptionDuration(plan, months)) {
++        return apiError(plan === "CUSTOM" ? "Custom renewal duration must be between 1 and 36 months." : "Basic and Pro renewals are only available for 6 or 12 months.", 400, { code: "INVALID_DURATION" });
++      }
+       const customPrice = body.customPrice === undefined || body.customPrice === null || body.customPrice === "" ? undefined : Number(body.customPrice);
+       const configuredPrice = resolvePlanPrice(plan, months, customPrice);
+-      const priceAmount = configuredPrice ?? subscription.priceAmount;
++      if (configuredPrice === null) {
++        return apiError("No price is configured for this plan/duration.", 400, { code: "INVALID_PLAN_PRICE" });
++      }
++      const priceAmount = configuredPrice;
+       const base = subscription.expiresAt > new Date() ? new Date(subscription.expiresAt) : new Date();
+       const expiresAt = new Date(base);
+       expiresAt.setMonth(expiresAt.getMonth() + months);
+       const maxDevices = body.maxDevices === undefined ? subscription.maxDevices : Number(body.maxDevices);
+-      if (!Number.isInteger(maxDevices) || maxDevices < 1 || maxDevices > 50) return apiError("maxDevices must be between 1 and 50.", 400);
++      if (!Number.isInteger(maxDevices) || maxDevices < MIN_DEVICE_LIMIT || maxDevices > MAX_DEVICE_LIMIT) return apiError(`maxDevices must be between ${MIN_DEVICE_LIMIT} and ${MAX_DEVICE_LIMIT}.`, 400);
+ 
+       const updated = await prisma.subscription.update({
+         where: { id: subscription.id },
+@@ -136,10 +150,18 @@
+           expiresAt,
+           maxDevices,
+           priceAmount,
++          renewedAt: new Date(),
++          renewalCount: { increment: 1 },
++          previousExpiresAt: subscription.expiresAt,
++          cancelledAt: null,
++          cancelReason: null,
+         },
+         select: { id: true, plan: true, status: true, expiresAt: true, maxDevices: true, priceAmount: true, currency: true },
+       });
+-      await prisma.restaurant.update({ where: { id: restaurantId }, data: { isActive: true } });
++      await prisma.$transaction([
++        prisma.restaurant.update({ where: { id: restaurantId }, data: { isActive: true } }),
++        prisma.user.updateMany({ where: { restaurantId }, data: { isActive: true } }),
++      ]);
+       return apiSuccess(updated);
+     }
+ 
+@@ -153,21 +175,51 @@
+         : action === "cancel"
+           ? SubscriptionStatus.CANCELLED
+           : SubscriptionStatus.ACTIVE;
+-      const updated = await prisma.subscription.update({
+-        where: { id: subscription.id },
+-        data: { status },
+-        select: { id: true, plan: true, status: true, expiresAt: true, maxDevices: true },
++      const now = new Date();
++      const updated = await prisma.$transaction(async (tx) => {
++        const next = await tx.subscription.update({
++          where: { id: subscription.id },
++          data: {
++            status,
++            cancelledAt: status === SubscriptionStatus.CANCELLED ? now : null,
++            cancelReason: status === SubscriptionStatus.CANCELLED ? (cleanText(body.reason, 500) ?? "Cancelled by control admin") : null,
++          },
++          select: { id: true, plan: true, status: true, expiresAt: true, maxDevices: true },
++        });
++        if (status === SubscriptionStatus.ACTIVE) {
++          await tx.restaurant.update({ where: { id: restaurantId }, data: { isActive: true } });
++          await tx.user.updateMany({ where: { restaurantId }, data: { isActive: true } });
++        } else {
++          await tx.restaurant.update({ where: { id: restaurantId }, data: { isActive: false } });
++          await tx.user.updateMany({ where: { restaurantId }, data: { isActive: false } });
++          await tx.device.updateMany({ where: { restaurantId, status: "ACTIVE" }, data: { status: "REVOKED", revokedAt: now } });
++        }
++        return next;
+       });
+       return apiSuccess(updated);
+     }
+ 
+     if (action === "set_account_active") {
+       if (typeof body.isActive !== "boolean") return apiError("isActive must be boolean.", 400);
+-      return apiSuccess(await prisma.restaurant.update({
+-        where: { id: restaurantId },
+-        data: { isActive: body.isActive },
+-        select: { id: true, name: true, isActive: true },
+-      }));
++      const now = new Date();
++      if (body.isActive) {
++        if (!subscription || subscription.status !== SubscriptionStatus.ACTIVE || subscription.expiresAt <= now) {
++          return apiError("An active, unexpired subscription is required before enabling the account.", 409, { code: "SUBSCRIPTION_REQUIRED" });
++        }
++        const updated = await prisma.$transaction(async (tx) => {
++          const result = await tx.restaurant.update({ where: { id: restaurantId }, data: { isActive: true }, select: { id: true, name: true, isActive: true } });
++          await tx.user.updateMany({ where: { restaurantId }, data: { isActive: true } });
++          return result;
++        });
++        return apiSuccess(updated);
++      }
++      const updated = await prisma.$transaction(async (tx) => {
++        const result = await tx.restaurant.update({ where: { id: restaurantId }, data: { isActive: false }, select: { id: true, name: true, isActive: true } });
++        await tx.user.updateMany({ where: { restaurantId }, data: { isActive: false } });
++        await tx.device.updateMany({ where: { restaurantId, status: "ACTIVE" }, data: { status: "REVOKED", revokedAt: now } });
++        return result;
++      });
++      return apiSuccess(updated);
+     }
+ 
+     if (action === "update_contact") {
+--- /tmp/kd/original/kd-admin-main/src/app/api/control/activation-codes/route.ts	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/src/app/api/control/activation-codes/route.ts	2026-08-31 09:42:01.830828952 +0000
+@@ -6,6 +6,7 @@
+ import { generateActivationCode } from "@/lib/activation-code";
+ import { prisma } from "@/lib/prisma";
+ import { rateLimit } from "@/lib/rate-limit";
++import { MAX_DEVICE_LIMIT, MIN_DEVICE_LIMIT, isValidSubscriptionDuration } from "@/lib/subscription-rules";
+ import {
+   resolvePlanPrice,
+   type SubscriptionPlanKey,
+@@ -45,20 +46,20 @@
+   return /^\+?[0-9][0-9\s().-]{5,28}[0-9]$/.test(value);
+ }
+ 
+-function addMonths(from: Date, months: number): Date {
+-  const result = new Date(from);
+-  result.setMonth(result.getMonth() + months);
+-  return result;
+-}
+ 
+ export async function GET(request: Request) {
+   const admin = await getControlAdmin(request);
+   if (!admin) return apiError("Unauthorized.", 401);
+ 
+   try {
++    const url = new URL(request.url);
++    const requestedLimit = Number(url.searchParams.get("limit") ?? "50");
++    const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(10, Math.trunc(requestedLimit))) : 50;
++    const cursor = url.searchParams.get("cursor") || undefined;
+     const rows = await prisma.activationCode.findMany({
+-      orderBy: { createdAt: "desc" },
+-      take: 500,
++      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
++      take: limit + 1,
++      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+       select: {
+         id: true,
+         status: true,
+@@ -79,7 +80,9 @@
+       },
+     });
+ 
+-    return apiSuccess(rows);
++    const hasMore = rows.length > limit;
++    const page = hasMore ? rows.slice(0, limit) : rows;
++    return apiSuccess({ items: page, nextCursor: hasMore ? page.at(-1)?.id ?? null : null });
+   } catch (error) {
+     console.error("CONTROL_ACTIVATION_CODES_GET_ERROR", error);
+     return apiError("Unable to load activation codes.", 500, { code: "INTERNAL_ERROR" });
+@@ -145,11 +148,11 @@
+     if (!Number.isInteger(durationMonths) || durationMonths < 1 || durationMonths > 36) {
+       return apiError("Duration must be between 1 and 36 months.", 400, { code: "VALIDATION_ERROR" });
+     }
+-    if (plan !== "CUSTOM" && durationMonths !== 6 && durationMonths !== 12) {
+-      return apiError("Basic and Pro subscriptions are only available for 6 or 12 months.", 400, { code: "VALIDATION_ERROR" });
++    if (!isValidSubscriptionDuration(plan, durationMonths)) {
++      return apiError(plan === "CUSTOM" ? "Custom subscriptions must be between 1 and 36 months." : "Basic and Pro subscriptions are only available for 6 or 12 months.", 400, { code: "INVALID_DURATION" });
+     }
+-    if (!Number.isInteger(maxDevices) || maxDevices < 1 || maxDevices > 10) {
+-      return apiError("Max devices must be between 1 and 10.", 400, { code: "VALIDATION_ERROR" });
++    if (!Number.isInteger(maxDevices) || maxDevices < MIN_DEVICE_LIMIT || maxDevices > MAX_DEVICE_LIMIT) {
++      return apiError(`Max devices must be between ${MIN_DEVICE_LIMIT} and ${MAX_DEVICE_LIMIT}.`, 400, { code: "VALIDATION_ERROR" });
+     }
+     if (plan === "CUSTOM" && (!Number.isFinite(customPrice) || (customPrice ?? 0) <= 0)) {
+       return apiError("Custom price must be greater than zero.", 400, { code: "VALIDATION_ERROR" });
+@@ -227,7 +230,11 @@
+     ]);
+ 
+     const now = new Date();
+-    const subscriptionExpiresAt = addMonths(now, durationMonths);
++    const subscriptionExpiresAt = requestedExpiry ?? (() => {
++      const result = new Date(now);
++      result.setMonth(result.getMonth() + durationMonths);
++      return result;
++    })();
+ 
+     const created = await prisma.$transaction(async (tx) => {
+       const restaurant = await tx.restaurant.create({
+--- /tmp/kd/original/kd-admin-main/src/app/api/control/devices/route.ts	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/src/app/api/control/devices/route.ts	2026-08-31 09:41:58.104771407 +0000
+@@ -5,8 +5,14 @@
+ export async function GET(request: Request) {
+   if (!(await getControlAdmin(request))) return apiError("Unauthorized.", 401);
+   try {
++    const url = new URL(request.url);
++    const requestedLimit = Number(url.searchParams.get("limit") ?? "50");
++    const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(10, Math.trunc(requestedLimit))) : 50;
++    const cursor = url.searchParams.get("cursor") || undefined;
+     const devices = await prisma.device.findMany({
+-      orderBy: { lastSeenAt: "desc" },
++      orderBy: [{ lastSeenAt: "desc" }, { id: "desc" }],
++      take: limit + 1,
++      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+       select: {
+         id: true, name: true, status: true, lastSeenAt: true, activatedAt: true,
+         revokedAt: true, appVersion: true, syncProtocolVersion: true,
+@@ -14,7 +20,9 @@
+         _count: { select: { syncOperations: true } },
+       },
+     });
+-    return apiSuccess(devices);
++    const hasMore = devices.length > limit;
++    const page = hasMore ? devices.slice(0, limit) : devices;
++    return apiSuccess({ items: page, nextCursor: hasMore ? page.at(-1)?.id ?? null : null });
+   } catch {
+     return apiError("Unable to load devices.", 500, { code: "INTERNAL_ERROR" });
+   }
+--- /tmp/kd/original/kd-admin-main/src/app/api/control/events/route.ts	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/src/app/api/control/events/route.ts	2026-08-31 09:41:58.104955716 +0000
+@@ -5,11 +5,19 @@
+ export async function GET(request: Request) {
+   if (!(await getControlAdmin(request))) return apiError("Unauthorized.", 401);
+   try {
++    const url = new URL(request.url);
++    const requestedLimit = Number(url.searchParams.get("limit") ?? "50");
++    const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(10, Math.trunc(requestedLimit))) : 50;
++    const cursor = url.searchParams.get("cursor") || undefined;
+     const events = await prisma.systemEvent.findMany({
+-      orderBy: { createdAt: "desc" },
++      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
++      take: limit + 1,
++      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+       select: { id: true, createdAt: true, severity: true, source: true, message: true, requestId: true },
+     });
+-    return apiSuccess(events);
++    const hasMore = events.length > limit;
++    const page = hasMore ? events.slice(0, limit) : events;
++    return apiSuccess({ items: page, nextCursor: hasMore ? page.at(-1)?.id ?? null : null });
+   } catch {
+     return apiError("Unable to load system events.", 500, { code: "INTERNAL_ERROR" });
+   }
+--- /tmp/kd/original/kd-admin-main/src/app/control/panel.tsx	2026-08-24 09:43:04.000000000 +0000
++++ /tmp/kd/kd-admin-main/src/app/control/panel.tsx	2026-08-31 09:42:12.233142839 +0000
+@@ -154,10 +154,8 @@
+   } | null;
+ };
+ 
+-type BugLogPage = {
+-  items: BugLog[];
+-  nextCursor: string | null;
+-};
++type Page<T> = { items: T[]; nextCursor: string | null };
++type BugLogPage = Page<BugLog>;
+ 
+ const formatDate = (
+   value: string | null | undefined,
+@@ -253,6 +251,11 @@
+ 
+   const [bugCursor, setBugCursor] =
+     useState<string | null>(null);
++  const [restaurantCursor, setRestaurantCursor] = useState<string | null>(null);
++  const [deviceCursor, setDeviceCursor] = useState<string | null>(null);
++  const [codeCursor, setCodeCursor] = useState<string | null>(null);
++  const [eventCursor, setEventCursor] = useState<string | null>(null);
++  const [loadingMore, setLoadingMore] = useState(false);
+ 
+   const [selectedBugId, setSelectedBugId] =
+     useState<string | null>(null);
+@@ -326,17 +329,17 @@
+         results[index]?.status === "fulfilled" ? (results[index] as PromiseFulfilledResult<T>).value : null;
+ 
+       const overviewData = value<Overview>(0);
+-      const restaurantData = value<Restaurant[]>(1);
+-      const deviceData = value<Device[]>(2);
+-      const codeData = value<Code[]>(3);
+-      const eventData = value<EventRow[]>(4);
++      const restaurantData = value<Page<Restaurant>>(1);
++      const deviceData = value<Page<Device>>(2);
++      const codeData = value<Page<Code>>(3);
++      const eventData = value<Page<EventRow>>(4);
+       const bugPage = value<BugLogPage>(5);
+ 
+       if (overviewData) setOverview(overviewData);
+-      if (restaurantData) setRestaurants(restaurantData);
+-      if (deviceData) setDevices(deviceData);
+-      if (codeData) setCodes(codeData);
+-      if (eventData) setEvents(eventData);
++      if (restaurantData) { setRestaurants(restaurantData.items); setRestaurantCursor(restaurantData.nextCursor); }
++      if (deviceData) { setDevices(deviceData.items); setDeviceCursor(deviceData.nextCursor); }
++      if (codeData) { setCodes(codeData.items); setCodeCursor(codeData.nextCursor); }
++      if (eventData) { setEvents(eventData.items); setEventCursor(eventData.nextCursor); }
+       if (bugPage) {
+         setBugLogs(bugPage.items);
+         setBugCursor(bugPage.nextCursor);
+@@ -371,6 +374,29 @@
+     };
+   }, [load]);
+ 
++  async function loadMorePage<T>(
++    endpoint: string,
++    cursor: string,
++    current: T[],
++    setItems: (items: T[]) => void,
++    setCursor: (cursor: string | null) => void,
++  ) {
++    setLoadingMore(true);
++    try {
++      const response = await fetch(`${endpoint}&cursor=${encodeURIComponent(cursor)}`, { cache: "no-store" });
++      const body = await response.json();
++      if (!response.ok || !body.success) throw new Error(body.error || "Unable to load more data");
++      const page = body.data as Page<T>;
++      const seen = new Set(current.map((item) => JSON.stringify(item)));
++      setItems([...current, ...page.items.filter((item) => !seen.has(JSON.stringify(item)))]);
++      setCursor(page.nextCursor);
++    } catch (error) {
++      setActionError(error instanceof Error ? error.message : "Unable to load more data");
++    } finally {
++      setLoadingMore(false);
++    }
++  }
++
+   async function loadOlderBugLogs() {
+     if (!bugCursor || bugLoadingMore) return;
+ 
+@@ -688,7 +714,7 @@
+ 
+     const body: Record<string, unknown> = { restaurantId: restaurant.id, action };
+     if (action === "renew") {
+-      const monthsInput = window.prompt("Renew for how many months? (1–36)", "12");
++      const monthsInput = window.prompt("Renew for how many months? Basic/Pro: 6 or 12; Custom: 1–36", "12");
+       if (monthsInput === null) return;
+       const months = Number(monthsInput);
+       if (!Number.isInteger(months) || months < 1 || months > 36) { setActionError("Renewal months must be between 1 and 36."); return; }
+@@ -696,6 +722,7 @@
+       if (planInput === null) return;
+       const nextPlan = planInput.trim().toUpperCase();
+       if (!["BASIC", "PRO", "CUSTOM"].includes(nextPlan)) { setActionError("Invalid plan."); return; }
++      if (nextPlan !== "CUSTOM" && months !== 6 && months !== 12) { setActionError("Basic and Pro renewals support only 6 or 12 months."); return; }
+       body.months = months;
+       body.plan = nextPlan;
+       body.maxDevices = subscription?.maxDevices ?? 1;
+@@ -1124,6 +1151,13 @@
+                     </tbody>
+                   </Table>
+                 </TableShell>
++                {restaurantCursor && (
++                  <div className="border-t border-slate-100 p-4 text-center">
++                    <Button variant="secondary" disabled={loadingMore} onClick={() => void loadMorePage("/api/control/restaurants?limit=50", restaurantCursor, restaurants, setRestaurants, setRestaurantCursor)}>
++                      {loadingMore ? "Loading…" : "Load more restaurants"}
++                    </Button>
++                  </div>
++                )}
+               </Panel>
+             </section>
+           )}
+@@ -1274,6 +1308,13 @@
+                     </tbody>
+                   </Table>
+                 </TableShell>
++                {deviceCursor && (
++                  <div className="border-t border-slate-100 p-4 text-center">
++                    <Button variant="secondary" disabled={loadingMore} onClick={() => void loadMorePage("/api/control/devices?limit=50", deviceCursor, devices, setDevices, setDeviceCursor)}>
++                      {loadingMore ? "Loading…" : "Load more devices"}
++                    </Button>
++                  </div>
++                )}
+               </Panel>
+             </section>
+           )}
+@@ -1628,6 +1669,13 @@
+                     </tbody>
+                   </Table>
+                 </TableShell>
++                {codeCursor && (
++                  <div className="border-t border-slate-100 p-4 text-center">
++                    <Button variant="secondary" disabled={loadingMore} onClick={() => void loadMorePage("/api/control/activation-codes?limit=50", codeCursor, codes, setCodes, setCodeCursor)}>
++                      {loadingMore ? "Loading…" : "Load more licenses"}
++                    </Button>
++                  </div>
++                )}
+               </Panel>
+             </section>
+           )}
+@@ -1887,6 +1935,13 @@
+                     </tbody>
+                   </Table>
+                 </TableShell>
++                {eventCursor && (
++                  <div className="border-t border-slate-100 p-4 text-center">
++                    <Button variant="secondary" disabled={loadingMore} onClick={() => void loadMorePage("/api/control/events?limit=50", eventCursor, events, setEvents, setEventCursor)}>
++                      {loadingMore ? "Loading…" : "Load more events"}
++                    </Button>
++                  </div>
++                )}
+               </Panel>
+             </section>
+           )}
+--- /dev/null	2026-08-31 09:35:07.995076787 +0000
++++ /tmp/kd/kd-admin-main/tests/subscription-rules.test.ts	2026-08-31 09:41:36.142613025 +0000
+@@ -0,0 +1,28 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { addMonths, isValidSubscriptionDuration, validateSubscriptionPrice } from "../src/lib/subscription-rules";
++
++test("Basic and Pro only accept configured 6/12 month durations", () => {
++  assert.equal(isValidSubscriptionDuration("BASIC", 6), true);
++  assert.equal(isValidSubscriptionDuration("PRO", 12), true);
++  assert.equal(isValidSubscriptionDuration("BASIC", 1), false);
++  assert.equal(isValidSubscriptionDuration("PRO", 36), false);
++});
++
++test("Custom plans accept 1-36 months", () => {
++  assert.equal(isValidSubscriptionDuration("CUSTOM", 1), true);
++  assert.equal(isValidSubscriptionDuration("CUSTOM", 36), true);
++  assert.equal(isValidSubscriptionDuration("CUSTOM", 37), false);
++});
++
++test("configured pricing never falls back to an old subscription price", () => {
++  assert.equal(validateSubscriptionPrice("PRO", 6), 5999);
++  assert.equal(validateSubscriptionPrice("PRO", 12), 7999);
++  assert.equal(validateSubscriptionPrice("PRO", 1), null);
++  assert.equal(validateSubscriptionPrice("CUSTOM", 12, 2500), 2500);
++  assert.equal(validateSubscriptionPrice("CUSTOM", 12, 0), null);
++});
++
++test("addMonths preserves calendar-month semantics", () => {
++  assert.equal(addMonths(new Date("2026-01-15T00:00:00.000Z"), 6).toISOString(), "2026-07-15T00:00:00.000Z");
++});

@@ -1,0 +1,41 @@
+{
+  "name": "kitchen-diaries-control-panel",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/run-next.mjs dev",
+    "build": "prisma generate && next build",
+    "start": "node scripts/run-next.mjs start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "prisma generate",
+    "db:migrate:deploy": "node -e \"console.log('Shared database migrations are owned by the Kitchen Diaries POS repository. Run npm run db:migrate:deploy there.')\"",
+    "db:seed:admin": "tsx prisma/seed-control-admin.ts",
+    "verify": "npm run lint && npm run typecheck && npm run build",
+    "setup:admin": "npm run db:generate && npm run db:seed:admin:first",
+    "test": "tsx --test tests/subscription-rules.test.ts",
+    "db:seed:admin:first": "tsx prisma/seed-control-admin.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "bcryptjs": "^3.0.3",
+    "jsonwebtoken": "^9.0.3",
+    "lucide-react": "^0.468.0",
+    "next": "^16.2.6",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@tailwindcss/postcss": "^4",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "prisma": "^6.19.3",
+    "tailwindcss": "^4",
+    "tsx": "^4.23.0",
+    "typescript": "^5"
+  }
+}
